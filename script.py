@@ -38,7 +38,14 @@ ENCODINGS_TO_TRY = [
 
 
 def detect_encoding(path):
-    """Try decoding the first 64KB with each encoding. Return the first that works."""
+    """
+    Try decoding the first 64KB with each encoding. Return the first that works.
+
+    Note: this is a fast heuristic based only on the head of the file. A file
+    can look like valid UTF-8 for its first 64KB and then have a latin-1 byte
+    (e.g. 0xe9 = 'é') further in. Callers that actually *read* the file
+    should use _read_csv_with_fallback so they can recover from that case.
+    """
     sample_bytes = path.read_bytes()[:65536]
     for encoding in ENCODINGS_TO_TRY:
         try:
@@ -47,6 +54,37 @@ def detect_encoding(path):
         except (UnicodeDecodeError, LookupError):
             continue
     return "utf-8"
+
+
+def _read_csv_with_fallback(path, detected_encoding, delimiter, **read_kwargs):
+    """
+    Read a CSV, retrying with every candidate encoding if a decode error
+    occurs. Necessary because detect_encoding() only samples the first 64KB,
+    so the 'detected' encoding can still be wrong for the full file.
+
+    Tries the detected encoding first (fast path), then the rest of
+    ENCODINGS_TO_TRY. Since latin-1/iso-8859-1 accept any byte, the fallback
+    is guaranteed to eventually succeed — worst case you get mojibake in
+    some columns, but the inspector still produces a report.
+
+    Returns (dataframe, encoding_that_actually_worked).
+    """
+    candidates = [detected_encoding] + [
+        e for e in ENCODINGS_TO_TRY if e != detected_encoding
+    ]
+
+    last_error = None
+    for encoding in candidates:
+        try:
+            df = pd.read_csv(path, encoding=encoding, delimiter=delimiter, **read_kwargs)
+            return df, encoding
+        except UnicodeDecodeError as error:
+            last_error = error
+            continue
+
+    raise RuntimeError(
+        f"All encodings failed: tried {candidates}. Last error: {last_error}"
+    )
 
 
 def detect_delimiter(path, encoding):
@@ -227,8 +265,10 @@ def inspect_csv(path, sample_pct=5.0):
 
     if total_rows <= 1000:
         try:
-            df = pd.read_csv(path, encoding=encoding, delimiter=delimiter,
-                             on_bad_lines="skip", low_memory=False)
+            df, actual_encoding = _read_csv_with_fallback(
+                path, encoding, delimiter,
+                on_bad_lines="skip", low_memory=False,
+            )
         except Exception as e:
             result["errors"].append(f"Full read failed: {e}")
             return result
@@ -236,14 +276,23 @@ def inspect_csv(path, sample_pct=5.0):
         skip_probability = 1 - (sample_n / total_rows)
         rng = np.random.RandomState(42)
         try:
-            df = pd.read_csv(
-                path, encoding=encoding, delimiter=delimiter,
+            df, actual_encoding = _read_csv_with_fallback(
+                path, encoding, delimiter,
                 on_bad_lines="skip", low_memory=False,
                 skiprows=lambda row_index: row_index > 0 and rng.random() < skip_probability,
             )
         except Exception as e:
             result["errors"].append(f"Sample read failed: {e}")
             return result
+
+    # If the fallback had to pick a different encoding than detect_encoding
+    # guessed, record that so the report shows the one that actually worked.
+    if actual_encoding != encoding:
+        result["errors"].append(
+            f"Encoding detection suggested '{encoding}' (based on first 64KB) "
+            f"but full read required '{actual_encoding}'"
+        )
+        result["encoding"] = actual_encoding
 
     result["sampled_rows"] = len(df)
 
