@@ -12,6 +12,8 @@ Matching strategy:
   Phase 2 — Substring: u_td_user_id appears inside cleaned_login
             UIDs sorted longest-first (most specific), logins longest-first.
             Greedy 1:1 assignment; once matched, both are removed from the pool.
+  Phase 3 — Pattern detection: analyze unmatched logins for common prefix/suffix
+            patterns using delimiter boundaries (-_.) to suggest re-run options.
 
 Usage:
     python3 generate_identity_map.py data/raw
@@ -21,6 +23,7 @@ Usage:
 
 import argparse
 import csv
+from collections import Counter
 import sys
 import time
 from pathlib import Path
@@ -171,6 +174,51 @@ def _find_candidates_chunk(uid_chunk, login_pairs):
 # Picklable top-level wrapper for ProcessPoolExecutor
 def _worker(args):
     return _find_candidates_chunk(*args)
+
+
+# ============================================================
+# Affix pattern detection
+# ============================================================
+
+AFFIX_DELIMITERS = set("-_.")
+
+
+def detect_affix_patterns(unmatched_logins, top_n=5, min_count=5):
+    """
+    Detect common prefix/suffix patterns in unmatched logins using
+    delimiter characters (-_.) as natural boundaries.
+
+    For each login, every delimiter position yields:
+      - a prefix candidate (start through delimiter, inclusive)
+      - a suffix candidate (delimiter through end, inclusive)
+
+    Only patterns appearing in at least min_count logins are returned —
+    low-frequency patterns are likely hashed/deactivated usernames, not
+    real organizational affixes.
+
+    Returns {"prefixes": [(pattern, count), ...], "suffixes": [...]},
+    each sorted by count descending and limited to top_n.
+    """
+    prefix_counts = Counter()
+    suffix_counts = Counter()
+
+    for login in unmatched_logins:
+        length = len(login)
+        for i, ch in enumerate(login):
+            if ch not in AFFIX_DELIMITERS:
+                continue
+            # Prefix: login[:i+1] — only if stripping leaves ≥1 char
+            if i + 1 < length:
+                prefix_counts[login[:i + 1]] += 1
+            # Suffix: login[i:] — only if stripping leaves ≥1 char
+            if i > 0:
+                suffix_counts[login[i:]] += 1
+
+    # Filter out low-frequency noise (hashed/deactivated accounts)
+    prefixes = [(p, c) for p, c in prefix_counts.most_common() if c >= min_count][:top_n]
+    suffixes = [(s, c) for s, c in suffix_counts.most_common() if c >= min_count][:top_n]
+
+    return {"prefixes": prefixes, "suffixes": suffixes}
 
 
 # ============================================================
@@ -387,6 +435,38 @@ examples:
         print(f"  Nothing to match (one side empty)\n")
 
     # ------------------------------------------------------------------
+    # Phase 3: Prefix/suffix pattern detection on unmatched logins
+    # ------------------------------------------------------------------
+    MIN_UNMATCHED_FOR_DETECTION = 10
+
+    unmatched_login_df = login_df[~login_df["login"].isin(matched_logins)]
+    unmatched_cleaned = unmatched_login_df["cleaned_lower"].tolist()
+
+    if len(unmatched_cleaned) >= MIN_UNMATCHED_FOR_DETECTION:
+        print(f"Phase 3: Prefix/suffix pattern detection "
+              f"({len(unmatched_cleaned):,} unmatched logins)...")
+        affix_results = detect_affix_patterns(unmatched_cleaned)
+
+        hint_parts = []
+        for affix_type, flag in [("prefixes", "--prefixes"), ("suffixes", "--suffixes")]:
+            entries = affix_results[affix_type]
+            if not entries:
+                continue
+            print(f"  Top {affix_type}:")
+            for pattern, count in entries:
+                pct = count / len(unmatched_cleaned) * 100
+                print(f'    "{pattern}"'.ljust(20)
+                      + f"found in {count:,} logins ({pct:.1f}%)")
+            args_str = " ".join(f'"{p}"' for p, _ in entries)
+            hint_parts.append(f"{flag} {args_str}")
+
+        if hint_parts:
+            print(f"\n  Hint: re-run with {' '.join(hint_parts)} "
+                  f"to try stripping these\n")
+        else:
+            print("  No common prefix/suffix patterns detected.\n")
+
+    # ------------------------------------------------------------------
     # Step 5: Write output
     # ------------------------------------------------------------------
     total_matched = len(all_matches)
@@ -401,7 +481,7 @@ examples:
             output_matched, index=False)
 
     # Unmatched users (both sides, separate columns)
-    unmatched_logins = sorted(login_df[~login_df["login"].isin(matched_logins)]["login"].tolist())
+    unmatched_logins = sorted(unmatched_login_df["login"].tolist())
     unmatched_uids = sorted(uid_df[~uid_df["u_td_user_id"].isin(matched_uids)]["u_td_user_id"].tolist())
 
     max_rows = max(len(unmatched_logins), len(unmatched_uids))
